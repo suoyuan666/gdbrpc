@@ -26,7 +26,6 @@ import queue
 import socket
 import sys
 import threading
-import traceback
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
@@ -109,12 +108,14 @@ class Server:
             file_handler = logging.FileHandler(log_path)
             file_handler.setFormatter(formatter)
 
-            terminal_handler = logging.StreamHandler()
-            terminal_handler.setFormatter(formatter)
-            terminal_handler.setLevel(logging.ERROR)
-
             self._logger.addHandler(file_handler)
-            self._logger.addHandler(terminal_handler)
+            # Note: a stderr StreamHandler is intentionally NOT attached.
+            # When this server runs inside GDB, Python's sys.stderr is
+            # redirected to GDB's output stream and gets captured by any
+            # concurrent `gdb.execute(..., to_string=True)` on the main
+            # thread, polluting captured command output (e.g. the netstat
+            # test in tests/test_runtime_net.py). Diagnostics remain
+            # available through the per-session file handler above.
 
     def start(self):
         try:
@@ -168,8 +169,10 @@ class Server:
 
             except Exception as e:
                 if self.running:
-                    traceback.print_exc()
-                    self._logger.error(f"Error accepting connection: {e}")
+                    # Use logger.exception to keep the traceback in the log
+                    # file only; printing to stderr would pollute any
+                    # concurrent gdb.execute(..., to_string=True) capture.
+                    self._logger.exception(f"Error accepting connection: {e}")
 
     def _process_requests_core(
         self, client: socket.socket, request: Request, status: PacketStatus
@@ -222,8 +225,10 @@ class Server:
             )
 
         except Exception as e:
-            traceback.print_exc()
-            self._logger.error(f"Error running callback {status}: {e}")
+            # Avoid stderr output (traceback.print_exc); it would leak
+            # into concurrent gdb.execute(..., to_string=True) capture
+            # when the server runs inside GDB.
+            self._logger.exception(f"Error running callback {status}: {e}")
 
     def _process_requests(self, client: socket.socket, address):
         while self.running:
@@ -266,8 +271,10 @@ class Server:
             except ConnectionError:
                 break
             except Exception as e:
-                traceback.print_exc()
-                self._logger.error(f"Error handling client {address}: {e}")
+                # Avoid stderr output (traceback.print_exc); it would leak
+                # into concurrent gdb.execute(..., to_string=True) capture
+                # when the server runs inside GDB.
+                self._logger.exception(f"Error handling client {address}: {e}")
 
         try:
             client.close()
