@@ -33,7 +33,6 @@ from typing import Any, Dict, Optional, Tuple
 import cloudpickle as pickle
 import gdb
 from gdbrpc.utils import (
-    DEFAULT_TIMEOUT,
     PacketStatus,
     Request,
     Response,
@@ -63,16 +62,17 @@ class GdbThread(threading.Thread):
 
 
 class AsyncExec:
-    def __init__(self, request: Request):
+    def __init__(self, request: Request, timeout: float = 300):
         self.request: Request = request
         self._queue = queue.Queue()
+        self._timeout = timeout
 
     def __call__(self):
         self.request(self._queue)
 
-    def get_result(self, timeout: float = DEFAULT_TIMEOUT) -> Any:
+    def get_result(self) -> Any:
         try:
-            return self._queue.get(timeout=timeout)
+            return self._queue.get(timeout=self._timeout)
         except queue.Empty:
             raise TimeoutError("No result available within the specified timeout")
 
@@ -84,9 +84,11 @@ class Server:
         port: int = 20819,
         log_level: int = logging.INFO,
         log_path: Optional[str] = None,
+        timeout: float = 300,
     ):
         self.port = port
         self.host = host
+        self._timeout = timeout
         self.server: socket.socket
         self.running = False
         self.accept_thread: Optional[GdbThread] = None
@@ -173,7 +175,7 @@ class Server:
         self, client: socket.socket, request: Request, status: PacketStatus
     ) -> None:
         try:
-            async_exec = AsyncExec(request)
+            async_exec = AsyncExec(request, timeout=self._timeout)
 
             # https://sourceware.org/gdb/current/onlinedocs/gdb.html/Threading-in-GDB.html
             # gdb.post_event is thread-safe, unlike gdb.execute.
@@ -203,7 +205,7 @@ class Server:
                     self._logger,
                 )
 
-            message = async_exec.get_result(timeout=DEFAULT_TIMEOUT)
+            message = async_exec.get_result()
 
             if isinstance(message, Exception):
                 message = f"Error: {str(message)}"

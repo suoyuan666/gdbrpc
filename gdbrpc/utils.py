@@ -29,8 +29,6 @@ import threading
 from enum import IntEnum
 from typing import Any
 
-DEFAULT_TIMEOUT = 300
-
 
 def recv_all(connection: socket.socket, length: int, logger: logging.Logger) -> bytes:
     data = b""

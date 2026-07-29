@@ -31,7 +31,6 @@ from typing import Dict, Optional, Tuple
 
 import cloudpickle as pickle
 from gdbrpc.utils import (
-    DEFAULT_TIMEOUT,
     PacketStatus,
     PostRequest,
     Request,
@@ -48,9 +47,11 @@ class Client:
         port: int = 20819,
         log_level: int = logging.INFO,
         log_path: Optional[str] = None,
+        timeout: float = 300,
     ):
         self._host = host
         self._port = port
+        self._timeout = timeout
         self._socket: socket.socket
         self._connected = False
         self._response = queue.Queue()
@@ -150,7 +151,7 @@ class Client:
         self,
         request: Request,
         post_request: Optional[PostRequest] = None,
-        timeout: float = DEFAULT_TIMEOUT,
+        timeout: Optional[float] = None,
     ):
         if not self._connected:
             raise ConnectionError("Not connected to server")
@@ -172,7 +173,9 @@ class Client:
         socket_send(self._socket, pickle.dumps(payload), self._logger)
 
         try:
-            rs = self._response.get(timeout=timeout)
+            rs = self._response.get(
+                timeout=self._timeout if timeout is None else timeout
+            )
         except queue.Empty:
             self._logger.error("Request timed out")
             raise TimeoutError("Request timed out")
