@@ -20,23 +20,30 @@
 #
 ############################################################################
 
+import json
 import logging
 import os
 import queue
 import socket
 import sys
 import threading
+import time
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import cloudpickle as pickle
 from gdbrpc.utils import (
+    FRAME_HEADER_SIZE,
+    EventType,
     PacketStatus,
     PostRequest,
     Request,
     Response,
+    format_endpoint,
+    make_session_uuid,
     socket_recv,
     socket_send,
+    truncate_text,
 )
 
 
@@ -54,8 +61,13 @@ class Client:
         self._timeout = timeout
         self._socket: socket.socket
         self._connected = False
+        self._session_uuid: Optional[str] = None
+        self._local_peer: Optional[str] = None
+        self._next_req_seq = 0
         self._response = queue.Queue()
-        self._pending_requests: Dict[int, PostRequest] = {}
+        self._pending_requests: Dict[int, Request] = {}
+        self._pending_callbacks: Dict[int, PostRequest] = {}
+        self._request_lock = threading.Lock()
 
         self._logger = logging.getLogger(__name__)
         if not self._logger.hasHandlers():
@@ -71,12 +83,40 @@ class Client:
             handler.setFormatter(formatter)
             self._logger.addHandler(handler)
 
+    def _log_event(
+        self, event: EventType, request: Optional[Request] = None, **fields
+    ) -> None:
+        parts = [f"peer={self._local_peer or 'unknown'}"]
+        parts.append(f"session={self._session_uuid or 'unknown'}")
+        if request is not None:
+            parts.append(f"req={request.req_seq or 'unknown'}")
+        parts.append(f"event={event.value}")
+        for key, value in fields.items():
+            if value is None:
+                continue
+            parts.append(f"{key}={value}")
+        self._logger.info(" ".join(parts))
+
+    def _payload_text(self, payload: Any) -> str:
+        if isinstance(payload, str):
+            return json.dumps(truncate_text(payload))
+        return json.dumps(truncate_text(str(payload)))
+
+    def _counts(self) -> Tuple[int, int]:
+        with self._request_lock:
+            return len(self._pending_requests), len(self._pending_callbacks)
+
     def connect(self):
         try:
             self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._socket.connect((self._host, self._port))
             self._connected = True
-            logging.info(f"Connected to GDB server at {self._host}:{self._port}")
+            self._session_uuid = make_session_uuid()
+            self._next_req_seq = 0
+            self._local_peer = format_endpoint(self._socket.getsockname())
+            self._log_event(
+                EventType.CONNECT, target=format_endpoint((self._host, self._port))
+            )
 
             threading.Thread(
                 target=self._listen_responses, daemon=True, args=(self._socket,)
@@ -90,42 +130,82 @@ class Client:
     def _listen_responses(self, socket: socket.socket):
         try:
             while self._connected:
-                data: Tuple[Response, PacketStatus] = pickle.loads(
-                    socket_recv(socket, self._logger)
-                )
+                data_bytes = socket_recv(socket)
+                data: Tuple[Response, PacketStatus] = pickle.loads(data_bytes)
                 response, status = data
-                self._logger.debug(
-                    f"Received response for request ID {response.tag}, current queue: {self._pending_requests}"
-                )
+
+                with self._request_lock:
+                    request = self._pending_requests.get(response.tag)
+                    callback = self._pending_callbacks.get(response.tag)
+
+                if request is not None:
+                    self._log_event(
+                        EventType.TRANSPORT_RECV_LEN,
+                        request,
+                        bytes=FRAME_HEADER_SIZE,
+                        frame_bytes=len(data_bytes),
+                        source=format_endpoint((self._host, self._port)),
+                    )
+                    self._log_event(
+                        EventType.TRANSPORT_RECV_BODY,
+                        request,
+                        bytes=len(data_bytes),
+                        source=format_endpoint((self._host, self._port)),
+                    )
 
                 if status == PacketStatus.PYTHON_VERSION_MISMATCH:
                     response.payload += f"\nclient python version: {sys.version}"
                     self._response.put(response.payload)
-                elif (
-                    status == PacketStatus.HAS_CALLBACK
-                    and response.tag in self._pending_requests
-                ):
-                    self._logger.debug(f"Handling callback for request ID {status}")
-                    callback = self._pending_requests.get(response.tag)
+                    self._log_event(
+                        EventType.RECV,
+                        request,
+                        stage="error",
+                        status="python_version_mismatch",
+                        payload=self._payload_text(response.payload),
+                    )
+                    continue
 
+                if status == PacketStatus.HAS_CALLBACK and request is not None:
                     assert isinstance(callback, PostRequest)
 
                     try:
                         callback(response.payload)
+                        self._log_event(
+                            EventType.CALLBACK,
+                            request,
+                            stage="result",
+                            status="ok",
+                            callback=f"{callback.__class__.__name__}",
+                            callback_dump=callback.callback_dump(),
+                            payload=self._payload_text(response.payload),
+                        )
                     except Exception as e:
-                        self._logger.error(
-                            f"Error in callback {callback}, which raised an exception: {e}"
+                        self._log_event(
+                            EventType.ERROR,
+                            request,
+                            stage="callback",
+                            status="error",
+                            callback=f"{callback.__class__.__name__}",
+                            callback_dump=callback.callback_dump(),
+                            error=self._payload_text(str(e)),
                         )
                     finally:
                         callback.finish.set()
+                        with self._request_lock:
+                            self._pending_callbacks.pop(response.tag, None)
+                            self._pending_requests.pop(response.tag, None)
                 else:
                     self._response.put(response)
-                    self._logger.debug(
-                        f"Response for request ID {response.tag} put into response queue"
+                    self._log_event(
+                        EventType.RECV,
+                        request,
+                        stage="result" if status == PacketStatus.NO_CALLBACK else "ack",
+                        status="ok",
+                        payload=self._payload_text(response.payload),
                     )
-                self._logger.info(
-                    f"Received data: {response.payload}. from {self._host}:{self._port}"
-                )
+                    with self._request_lock:
+                        if status == PacketStatus.NO_CALLBACK:
+                            self._pending_requests.pop(response.tag, None)
         except ConnectionError:
             self._logger.info("Connection closed by server")
             self.disconnect()
@@ -135,17 +215,17 @@ class Client:
 
     def disconnect(self):
         self._connected = False
-        self._logger.info("Disconnecting...")
+        self._log_event(
+            EventType.DISCONNECT, target=format_endpoint((self._host, self._port))
+        )
         if self._socket:
             try:
                 self._socket.close()
-                self._logger.info("Socket closed successfully.")
             except Exception as e:
                 self._logger.error(f"Error closing socket: {e}")
-        self._logger.info("Disconnected")
 
     def no_pending_requests(self) -> bool:
-        return len(self._pending_requests) == 0
+        return len(self._pending_requests) == 0 and len(self._pending_callbacks) == 0
 
     def call(
         self,
@@ -160,24 +240,98 @@ class Client:
         if post_request is not None and not isinstance(post_request, PostRequest):
             raise TypeError("post_request must be a PostRequest instance or None")
 
+        if self._session_uuid is None or self._local_peer is None:
+            raise ConnectionError("Session is not initialized")
+
+        with self._request_lock:
+            self._next_req_seq += 1
+            request.req_seq = f"{self._next_req_seq:04d}"
+            request.session_uuid = self._session_uuid
+            request.peer = self._local_peer
+            self._pending_requests[request.tag] = request
+            if post_request is not None:
+                self._pending_callbacks[request.tag] = post_request
+
         if post_request is not None:
-            self._logger.debug(f"Registering callback for request ID {request.tag}")
-            self._pending_requests[request.tag] = post_request
-            payload = (request, PacketStatus.HAS_CALLBACK)
+            callback_type = post_request.__class__.__name__
+            callback_dump = post_request.callback_dump()
+            payload = {
+                "request": request,
+                "status": PacketStatus.HAS_CALLBACK,
+                "callback_type": callback_type,
+                "callback_dump": callback_dump,
+            }
         else:
-            self._logger.debug(f"No callback for request ID {request.tag}")
-            payload = (request, PacketStatus.NO_CALLBACK)
+            callback_dump = None
+            callback_type = None
+            payload = {
+                "request": request,
+                "status": PacketStatus.NO_CALLBACK,
+                "callback_type": None,
+                "callback_dump": None,
+            }
 
-        self._logger.debug(f"Sending request: {request} to {self._host}:{self._port}")
+        self._log_event(
+            EventType.SEND,
+            request,
+            type=request.__class__.__name__,
+            dump=request.dump(),
+            **(
+                {"callback": callback_type, "callback_dump": callback_dump}
+                if post_request is not None
+                else {}
+            ),
+            target=format_endpoint((self._host, self._port)),
+        )
 
-        socket_send(self._socket, pickle.dumps(payload), self._logger)
+        data = pickle.dumps(payload)
+        socket_send(self._socket, data)
+        self._log_event(
+            EventType.TRANSPORT_SEND_LEN,
+            request,
+            bytes=FRAME_HEADER_SIZE,
+            frame_bytes=len(data),
+            target=format_endpoint((self._host, self._port)),
+        )
+        self._log_event(
+            EventType.TRANSPORT_SEND_BODY,
+            request,
+            bytes=len(data),
+            target=format_endpoint((self._host, self._port)),
+        )
+
+        started_at = time.monotonic()
+        actual_timeout = self._timeout if timeout is None else timeout
 
         try:
-            rs = self._response.get(
-                timeout=self._timeout if timeout is None else timeout
-            )
+            rs = self._response.get(timeout=actual_timeout)
         except queue.Empty:
-            self._logger.error("Request timed out")
+            elapsed_s = time.monotonic() - started_at
+            pending_requests, pending_callbacks = self._counts()
+
+            self._log_event(
+                EventType.TIMEOUT,
+                request,
+                stage="waiting_result",
+                target="transport_recv",
+                timeout_s=int(actual_timeout),
+                elapsed_s=f"{elapsed_s:.3f}",
+                dump=request.dump(),
+                **(
+                    {
+                        "callback": callback_type,
+                        "callback_dump": callback_dump,
+                        "pending_requests": pending_requests,
+                        "pending_callbacks": pending_callbacks,
+                    }
+                    if post_request is not None
+                    else {
+                        "pending_requests": pending_requests,
+                        "pending_callbacks": pending_callbacks,
+                    }
+                ),
+                note="Client did not receive response within timeout",
+            )
             raise TimeoutError("Request timed out")
 
         return rs.payload

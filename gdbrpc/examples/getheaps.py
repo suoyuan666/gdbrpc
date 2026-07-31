@@ -21,6 +21,7 @@
 #
 ############################################################################
 
+import json
 import os
 import queue
 import sys
@@ -33,6 +34,13 @@ import gdbrpc  # noqa: E402
 class Func(gdbrpc.Request):
     def __init__(self):
         super().__init__()
+
+    def dump(self) -> str:
+        return json.dumps(
+            {"type": self.__class__.__name__, "fields": {}},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     def __call__(self, q: queue.Queue):
         import nxgdb

@@ -21,6 +21,7 @@
 #
 ############################################################################
 
+import json
 import logging
 import os
 import queue
@@ -53,6 +54,13 @@ command_list = nxgdb_list + gdb_list
 class ReturnStrValue(gdbrpc.Request):
     def __init__(self):
         super().__init__()
+
+    def dump(self) -> str:
+        return json.dumps(
+            {"type": self.__class__.__name__, "fields": {}},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     def __call__(self, event: queue.Queue):
         import nxgdb

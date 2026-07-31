@@ -20,58 +20,92 @@
 #
 ############################################################################
 
-import logging
+import json
 import queue
 import socket
 import struct
 import subprocess
 import threading
-from enum import IntEnum
-from typing import Any
+import uuid
+from dataclasses import dataclass
+from enum import Enum, IntEnum
+from typing import Any, Optional, Tuple
+
+FRAME_HEADER_SIZE = 4
 
 
-def recv_all(connection: socket.socket, length: int, logger: logging.Logger) -> bytes:
+def recv_all(connection: socket.socket, length: int) -> bytes:
     data = b""
     while len(data) < length:
         chunk = connection.recv(length - len(data))
         if not chunk:
-            logger.error("Socket connection broken during receive")
             raise ConnectionError("Socket connection broken during receive")
         data += chunk
     return data
 
 
-def socket_recv(connection: socket.socket, logger: logging.Logger) -> bytes:
-    length_data = recv_all(connection, 4, logger)
+def socket_recv(connection: socket.socket) -> bytes:
+    length_data = recv_all(connection, FRAME_HEADER_SIZE)
     # https://docs.python.org/3.10/library/struct.html#format-characters
     data_length = struct.unpack("!I", length_data)[0]
-    logger.debug(f"Expecting to receive {data_length} bytes")
-
-    return recv_all(connection, data_length, logger)
+    return recv_all(connection, data_length)
 
 
-def send_all(connection: socket.socket, data: bytes, logger: logging.Logger) -> None:
+def send_all(connection: socket.socket, data: bytes) -> None:
     total_sent = 0
     while total_sent < len(data):
         sent = connection.send(data[total_sent:])
         if sent == 0:
-            logger.error("Socket connection broken during send")
             raise RuntimeError("Socket connection broken")
         total_sent += sent
 
 
-def socket_send(connection: socket.socket, data: bytes, logger: logging.Logger) -> None:
-    try:
-        data_length = len(data)
-        length_prefix = struct.pack("!I", data_length)
-        logger.debug(f"Sending {data_length} bytes")
+def socket_send(connection: socket.socket, data: bytes) -> None:
+    length_prefix = struct.pack("!I", len(data))
+    send_all(connection, length_prefix)
+    send_all(connection, data)
 
-        send_all(connection, length_prefix, logger)
-        send_all(connection, data, logger)
 
-    except Exception as e:
-        logger.error(f"Error sending response: {e}")
-        raise
+def make_session_uuid() -> str:
+    return f"sess-{uuid.uuid4().hex[:8]}"
+
+
+def format_endpoint(endpoint: Optional[Tuple[str, int]]) -> str:
+    if not endpoint:
+        return "unknown"
+    host, port = endpoint
+    return f"{host}:{port}"
+
+
+def truncate_text(text: str, limit: int = 256) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...[truncated,total={len(text)}]"
+
+
+class EventType(str, Enum):
+    CONNECT = "connect"
+    DISCONNECT = "disconnect"
+    SEND = "send"
+    RECV = "recv"
+    CALLBACK = "callback"
+    ERROR = "error"
+    TIMEOUT = "timeout"
+    DISPATCH = "dispatch"
+    DONE = "done"
+    REPLY = "reply"
+    TRANSPORT_SEND_LEN = "transport_send_len"
+    TRANSPORT_SEND_BODY = "transport_send_body"
+    TRANSPORT_RECV_LEN = "transport_recv_len"
+    TRANSPORT_RECV_BODY = "transport_recv_body"
+
+
+@dataclass
+class RequestContext:
+    request: "Request"
+    status: "PacketStatus"
+    callback_type: Optional[str] = None
+    callback_dump: Optional[str] = None
 
 
 class PacketStatus(IntEnum):
@@ -89,9 +123,25 @@ class Response:
 class Request:
     def __init__(self):
         self.tag = id(self)
+        self.req_seq: Optional[str] = None
+        self.session_uuid: Optional[str] = None
+        self.peer: Optional[str] = None
 
     def __call__(self, *args: Any, **kwds: Any) -> Any:
         raise NotImplementedError("Subclasses must implement this method")
+
+    def dump(self) -> str:
+        """Return a JSON string representation of this request.
+
+        Subclasses MUST override this method to provide a pure function
+        that returns a deterministic JSON string. The output should:
+        - Be deterministic (same input -> same output)
+        - Not include internal fields (tag, req_seq, session_uuid, peer)
+        - Include all relevant business fields
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__}.dump() must be implemented by subclass"
+        )
 
 
 class PostRequest(Request):
@@ -101,6 +151,16 @@ class PostRequest(Request):
 
     def __call__(self, argument: Any):
         raise NotImplementedError("Subclasses must implement this method")
+
+    def callback_dump(self) -> str:
+        """Return a JSON string representation of this callback.
+
+        Subclasses MUST override this method if they have additional fields
+        to dump beyond what dump() provides.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__}.callback_dump() must be implemented by subclass"
+        )
 
 
 class ShellExec(Request):
@@ -118,6 +178,19 @@ class ShellExec(Request):
             self.is_gdb_command = False
 
         self.command = command
+
+    def dump(self) -> str:
+        return json.dumps(
+            {
+                "type": self.__class__.__name__,
+                "fields": {
+                    "command": self.command,
+                    "is_gdb_command": self.is_gdb_command,
+                },
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     def _run_shell_command(self, command) -> str:
         try:

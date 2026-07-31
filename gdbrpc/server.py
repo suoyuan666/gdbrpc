@@ -20,23 +20,30 @@
 #
 ############################################################################
 
+import json
 import logging
 import os
 import queue
 import socket
 import sys
 import threading
+import time
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
 import cloudpickle as pickle
 import gdb
 from gdbrpc.utils import (
+    FRAME_HEADER_SIZE,
+    EventType,
     PacketStatus,
     Request,
+    RequestContext,
     Response,
+    format_endpoint,
     socket_recv,
     socket_send,
+    truncate_text,
 )
 
 
@@ -93,6 +100,10 @@ class Server:
         self.accept_thread: Optional[GdbThread] = None
         self.clients_lock = threading.Lock()
         self.clients: Dict[Tuple[str, int], socket.socket] = {}
+        self._state_lock = threading.Lock()
+        self._pending_requests: Dict[int, Request] = {}
+        self._pending_callbacks: Dict[int, str] = {}
+        self._sessions: Dict[Tuple[str, int], str] = {}
 
         self._logger = logging.getLogger(__name__)
         if not self._logger.hasHandlers():
@@ -116,6 +127,72 @@ class Server:
             # thread, polluting captured command output (e.g. the netstat
             # test in tests/test_runtime_net.py). Diagnostics remain
             # available through the per-session file handler above.
+
+    def _log_event(
+        self,
+        address: Tuple[str, int],
+        event: EventType,
+        request: Optional[Request] = None,
+        **fields,
+    ) -> None:
+        session_uuid = request.session_uuid if request is not None else None
+        if session_uuid is None:
+            session_uuid = self._sessions.get(address)
+        parts = [f"peer={format_endpoint(address)}"]
+        parts.append(f"session={session_uuid or 'unknown'}")
+        if request is not None:
+            parts.append(f"req={request.req_seq or 'unknown'}")
+        parts.append(f"event={event.value}")
+        for key, value in fields.items():
+            if value is None:
+                continue
+            parts.append(f"{key}={value}")
+        self._logger.info(" ".join(parts))
+
+    def _payload_text(self, payload: Any) -> str:
+        if isinstance(payload, str):
+            return json.dumps(truncate_text(payload))
+        return json.dumps(truncate_text(str(payload)))
+
+    def _register_request(
+        self, address: Tuple[str, int], request: Request, callback_dump: Optional[str]
+    ):
+        with self._state_lock:
+            self._pending_requests[request.tag] = request
+            if callback_dump is not None:
+                self._pending_callbacks[request.tag] = callback_dump
+            if request.session_uuid is not None:
+                self._sessions[address] = request.session_uuid
+
+    def _complete_request(self, request: Request):
+        with self._state_lock:
+            self._pending_requests.pop(request.tag, None)
+            self._pending_callbacks.pop(request.tag, None)
+
+    def _counts(self) -> Tuple[int, int]:
+        with self._state_lock:
+            return len(self._pending_requests), len(self._pending_callbacks)
+
+    def _unpack_payload(self, payload: Any) -> RequestContext:
+        callback_dump: Optional[str] = None
+        callback_type: Optional[str] = None
+        if isinstance(payload, dict):
+            request = payload["request"]
+            status = payload["status"]
+            callback_type = payload.get("callback_type")
+            callback_dump = payload.get("callback_dump")
+        elif isinstance(payload, tuple):
+            if len(payload) == 3:
+                request, status, callback_dump = payload
+            else:
+                request, status = payload
+        else:
+            raise TypeError(f"Unsupported payload type: {type(payload)!r}")
+
+        if not isinstance(status, PacketStatus):
+            status = PacketStatus(status)
+        assert isinstance(request, Request)
+        return RequestContext(request, status, callback_type, callback_dump)
 
     def start(self):
         try:
@@ -157,9 +234,7 @@ class Server:
                 with self.clients_lock:
                     self.clients[address] = client
 
-                self._logger.debug(
-                    f"Accepted connection from {address}, total clients: {len(self.clients)}"
-                )
+                self._log_event(address, EventType.CONNECT)
 
                 GdbThread(
                     target=self._process_requests,
@@ -169,14 +244,17 @@ class Server:
 
             except Exception as e:
                 if self.running:
-                    # Use logger.exception to keep the traceback in the log
-                    # file only; printing to stderr would pollute any
-                    # concurrent gdb.execute(..., to_string=True) capture.
                     self._logger.exception(f"Error accepting connection: {e}")
 
     def _process_requests_core(
-        self, client: socket.socket, request: Request, status: PacketStatus
+        self,
+        client: socket.socket,
+        address: Tuple[str, int],
+        ctx: RequestContext,
     ) -> None:
+        started_at = time.monotonic()
+        request, status = ctx.request, ctx.status
+        callback_type, callback_dump = ctx.callback_type, ctx.callback_dump
         try:
             async_exec = AsyncExec(request, timeout=self._timeout)
 
@@ -185,57 +263,134 @@ class Server:
             # gdb.post_event provides an ability to run any callable objects in the gdb main thread.
             gdb.post_event(async_exec)
 
-            if status == PacketStatus.HAS_CALLBACK:
-                self._logger.debug(
-                    f"Posted event for callback {status} with {request}, waiting for completion"
-                )
-            else:
-                self._logger.debug(
-                    f"Posted event with {request}, waiting for completion"
-                )
+            self._log_event(
+                address,
+                EventType.DISPATCH,
+                request,
+                type=request.__class__.__name__,
+            )
 
-            # If the request does not has callback, we should send message to client immediately.
-            # Because the client call must be not blocked.
             if status == PacketStatus.HAS_CALLBACK:
-                socket_send(
-                    client,
-                    pickle.dumps(
-                        (
-                            Response(request.tag, request.tag),
-                            PacketStatus.NO_CALLBACK,
-                        )
-                    ),
-                    self._logger,
+                self._log_event(
+                    address,
+                    EventType.REPLY,
+                    request,
+                    stage="ack",
+                    status="ok",
+                    callback=callback_type,
+                    callback_dump=callback_dump,
+                )
+                ack_bytes = pickle.dumps(
+                    (Response(request.tag, request.tag), PacketStatus.NO_CALLBACK)
+                )
+                socket_send(client, ack_bytes)
+                self._log_event(
+                    address,
+                    EventType.TRANSPORT_SEND_LEN,
+                    request,
+                    bytes=FRAME_HEADER_SIZE,
+                    frame_bytes=len(ack_bytes),
+                    target=format_endpoint(address),
+                )
+                self._log_event(
+                    address,
+                    EventType.TRANSPORT_SEND_BODY,
+                    request,
+                    bytes=len(ack_bytes),
+                    target=format_endpoint(address),
                 )
 
             message = async_exec.get_result()
-
             if isinstance(message, Exception):
                 message = f"Error: {str(message)}"
 
-            if status == PacketStatus.HAS_CALLBACK:
-                self._logger.debug(f"Callback {status} with {request} completed")
-            else:
-                self._logger.debug(f"{request} completed")
-
-            socket_send(
-                client,
-                pickle.dumps((Response(request.tag, message), status)),
-                self._logger,
+            self._log_event(
+                address,
+                EventType.DONE,
+                request,
+                stage="result",
+                status="ok",
+                callback=callback_type,
+                callback_dump=callback_dump,
+                payload=self._payload_text(message),
             )
 
+            response_bytes = pickle.dumps((Response(request.tag, message), status))
+            socket_send(client, response_bytes)
+            self._log_event(
+                address,
+                EventType.TRANSPORT_SEND_LEN,
+                request,
+                bytes=FRAME_HEADER_SIZE,
+                frame_bytes=len(response_bytes),
+                target=format_endpoint(address),
+            )
+            self._log_event(
+                address,
+                EventType.TRANSPORT_SEND_BODY,
+                request,
+                bytes=len(response_bytes),
+                target=format_endpoint(address),
+            )
+
+            self._complete_request(request)
+
+        except TimeoutError:
+            elapsed_s = time.monotonic() - started_at
+            pending_requests, pending_callbacks = self._counts()
+            self._log_event(
+                address,
+                EventType.TIMEOUT,
+                request,
+                stage="waiting_result",
+                target="async_exec",
+                timeout_s=int(self._timeout),
+                elapsed_s=f"{elapsed_s:.3f}",
+                callback=callback_type,
+                callback_dump=callback_dump,
+                pending_requests=pending_requests,
+                pending_callbacks=pending_callbacks,
+                note="AsyncExec did not receive result from gdb main thread",
+            )
+            error_msg = (
+                f"Timeout after {elapsed_s:.1f}s: AsyncExec did not receive result"
+            )
+            try:
+                error_bytes = pickle.dumps((Response(request.tag, error_msg), status))
+                socket_send(client, error_bytes)
+            except Exception:
+                # Avoid stderr output in GDB environment
+                pass
+            self._complete_request(request)
         except Exception as e:
             # Avoid stderr output (traceback.print_exc); it would leak
             # into concurrent gdb.execute(..., to_string=True) capture
             # when the server runs inside GDB.
-            self._logger.exception(f"Error running callback {status}: {e}")
+            self._log_event(
+                address,
+                EventType.ERROR,
+                request,
+                stage="dispatch",
+                status="error",
+                error=self._payload_text(str(e)),
+                callback=callback_type,
+                callback_dump=callback_dump,
+            )
+            try:
+                error_msg = f"Error: {str(e)}"
+                error_bytes = pickle.dumps((Response(request.tag, error_msg), status))
+                socket_send(client, error_bytes)
+            except Exception:
+                # Avoid stderr output in GDB environment
+                pass
+            self._complete_request(request)
 
-    def _process_requests(self, client: socket.socket, address):
+    def _process_requests(self, client: socket.socket, address: Tuple[str, int]):
         while self.running:
             try:
                 try:
-                    data_bytes = socket_recv(client, self._logger)
-                    payload: Tuple[Request, PacketStatus] = pickle.loads(data_bytes)
+                    data_bytes = socket_recv(client)
+                    payload = pickle.loads(data_bytes)
                 except (TypeError, ValueError) as e:
                     # cloudpickle needs the same Python version to serialize/deserialize the object.
                     #
@@ -255,16 +410,46 @@ class Server:
                     response = pickle.dumps(
                         (Response(0, message), PacketStatus.PYTHON_VERSION_MISMATCH)
                     )
-                    socket_send(client, response, self._logger)
+                    socket_send(client, response)
                     continue
 
-                request, status = payload
-                self._logger.info(f"Received request from {address}: {request}")
-                assert isinstance(request, Request)
+                ctx = self._unpack_payload(payload)
+                self._register_request(address, ctx.request, ctx.callback_dump)
+
+                self._log_event(
+                    address,
+                    EventType.TRANSPORT_RECV_LEN,
+                    ctx.request,
+                    bytes=FRAME_HEADER_SIZE,
+                    frame_bytes=len(data_bytes),
+                    source=format_endpoint(address),
+                )
+                self._log_event(
+                    address,
+                    EventType.TRANSPORT_RECV_BODY,
+                    ctx.request,
+                    bytes=len(data_bytes),
+                    source=format_endpoint(address),
+                )
+                self._log_event(
+                    address,
+                    EventType.RECV,
+                    ctx.request,
+                    type=ctx.request.__class__.__name__,
+                    dump=ctx.request.dump(),
+                    **(
+                        {
+                            "callback": ctx.callback_type,
+                            "callback_dump": ctx.callback_dump,
+                        }
+                        if ctx.callback_dump is not None
+                        else {}
+                    ),
+                )
 
                 GdbThread(
                     target=self._process_requests_core,
-                    args=(client, request, status),
+                    args=(client, address, ctx),
                     daemon=True,
                 ).start()
 
@@ -278,13 +463,11 @@ class Server:
 
         try:
             client.close()
-            self._logger.info(f"Closed connection from {address}")
+            self._log_event(address, EventType.DISCONNECT)
             with self.clients_lock:
-                if address in self.clients:
-                    del self.clients[address]
-                    self._logger.debug(
-                        f"Removed client {address}, total clients: {len(self.clients)}"
-                    )
+                self.clients.pop(address, None)
+            with self._state_lock:
+                self._sessions.pop(address, None)
         except Exception as e:
             self._logger.error(f"Error closing client socket {address}: {e}")
 
@@ -293,7 +476,7 @@ class Server:
             for address, client in self.clients.items():
                 try:
                     client.close()
-                    self._logger.info(f"Closed client connection from {address}")
+                    self._log_event(address, EventType.DISCONNECT)
                 except Exception as e:
                     self._logger.error(f"Error closing client socket {address}: {e}")
             self.clients.clear()

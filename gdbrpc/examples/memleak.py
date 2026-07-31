@@ -21,6 +21,7 @@
 #
 ############################################################################
 
+import json
 import logging
 import os
 import queue
@@ -35,6 +36,16 @@ class FetchResult(gdbrpc.PostRequest):
     def __init__(self):
         super().__init__()
 
+    def callback_dump(self) -> str:
+        return json.dumps(
+            {
+                "type": self.__class__.__name__,
+                "fields": {"purpose": "wait for memleak result"},
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
     def __call__(self, result):
         print(result)
 
@@ -42,6 +53,13 @@ class FetchResult(gdbrpc.PostRequest):
 class MemLeak(gdbrpc.Request):
     def __init__(self):
         super().__init__()
+
+    def dump(self) -> str:
+        return json.dumps(
+            {"type": self.__class__.__name__, "fields": {}},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     def __call__(self, q: queue.Queue):
         import gdb
