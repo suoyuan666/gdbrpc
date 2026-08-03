@@ -204,7 +204,10 @@ class Client:
                         payload=self._payload_text(response.payload),
                     )
                     with self._request_lock:
-                        if status == PacketStatus.NO_CALLBACK:
+                        # Only pop for a true final result. A NO_CALLBACK reply
+                        # with a pending callback is the ACK of a two-step
+                        # HAS_CALLBACK request, whose result must match it.
+                        if status == PacketStatus.NO_CALLBACK and callback is None:
                             self._pending_requests.pop(response.tag, None)
         except ConnectionError:
             self._logger.info("Connection closed by server")
