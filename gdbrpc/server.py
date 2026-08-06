@@ -78,7 +78,10 @@ class AsyncExec:
 
     def get_result(self) -> Any:
         try:
-            return self._queue.get(timeout=self._timeout)
+            if self._timeout == 0:
+                return self._queue.get()
+            else:
+                return self._queue.get(timeout=self._timeout)
         except queue.Empty:
             raise TimeoutError("No result available within the specified timeout")
 
@@ -256,7 +259,8 @@ class Server:
         request, status = ctx.request, ctx.status
         callback_type, callback_dump = ctx.callback_type, ctx.callback_dump
         try:
-            async_exec = AsyncExec(request, timeout=self._timeout)
+            async_timeout = 0 if status == PacketStatus.HAS_CALLBACK else self._timeout
+            async_exec = AsyncExec(request, timeout=async_timeout)
 
             # https://sourceware.org/gdb/current/onlinedocs/gdb.html/Threading-in-GDB.html
             # gdb.post_event is thread-safe, unlike gdb.execute.
