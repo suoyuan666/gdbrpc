@@ -22,25 +22,26 @@
 
 import json
 import logging
-import os
 import queue
 import socket
 import sys
 import threading
 import time
-from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
 import cloudpickle as pickle
 import gdb
 from gdbrpc.utils import (
     FRAME_HEADER_SIZE,
+    HUMAN_ONLY_FIELDS,
     EventType,
     PacketStatus,
     Request,
     RequestContext,
     Response,
     format_endpoint,
+    format_human_event,
+    setup_file_logging,
     socket_recv,
     socket_send,
     truncate_text,
@@ -94,6 +95,7 @@ class Server:
         log_level: int = logging.INFO,
         log_path: Optional[str] = None,
         timeout: float = 300,
+        human_log_path: Optional[str] = None,
     ):
         self.port = port
         self.host = host
@@ -108,28 +110,23 @@ class Server:
         self._pending_callbacks: Dict[int, str] = {}
         self._sessions: Dict[Tuple[str, int], str] = {}
 
-        self._logger = logging.getLogger(__name__)
-        if not self._logger.hasHandlers():
-            self._logger.setLevel(log_level)
+        self._logger, self._human_logger = setup_file_logging(
+            __name__, "gdbrpc_server", log_level, log_path, human_log_path
+        )
+        # Note: a stderr StreamHandler is intentionally NOT attached.
+        # When this server runs inside GDB, Python's sys.stderr is
+        # redirected to GDB's output stream and gets captured by any
+        # concurrent `gdb.execute(..., to_string=True)` on the main
+        # thread, polluting captured command output (e.g. the netstat
+        # test in tests/test_runtime_net.py). Diagnostics remain
+        # available through the per-session file handler above.
 
-            formatter = logging.Formatter("%(asctime)s gdbrpc_server: %(message)s")
-
-            if log_path is None:
-                timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-                pid = os.getpid()
-                log_path = f"gdbrpc_server-{timestamp}-pid{pid}.log"
-
-            file_handler = logging.FileHandler(log_path)
-            file_handler.setFormatter(formatter)
-
-            self._logger.addHandler(file_handler)
-            # Note: a stderr StreamHandler is intentionally NOT attached.
-            # When this server runs inside GDB, Python's sys.stderr is
-            # redirected to GDB's output stream and gets captured by any
-            # concurrent `gdb.execute(..., to_string=True)` on the main
-            # thread, polluting captured command output (e.g. the netstat
-            # test in tests/test_runtime_net.py). Diagnostics remain
-            # available through the per-session file handler above.
+    def _log_human_event(
+        self, event: EventType, request: Optional[Request] = None, **fields
+    ) -> None:
+        message = format_human_event("server", event, request, **fields)
+        if message is not None:
+            self._human_logger.info(message)
 
     def _log_event(
         self,
@@ -147,15 +144,15 @@ class Server:
             parts.append(f"req={request.req_seq or 'unknown'}")
         parts.append(f"event={event.value}")
         for key, value in fields.items():
-            if value is None:
+            if value is None or key in HUMAN_ONLY_FIELDS:
                 continue
             parts.append(f"{key}={value}")
         self._logger.info(" ".join(parts))
+        self._log_human_event(event, request, **fields)
 
-    def _payload_text(self, payload: Any) -> str:
-        if isinstance(payload, str):
-            return json.dumps(truncate_text(payload))
-        return json.dumps(truncate_text(str(payload)))
+    def _payload_text(self, payload: Any, limit: Optional[int] = 256) -> str:
+        text = payload if isinstance(payload, str) else str(payload)
+        return json.dumps(truncate_text(text, limit))
 
     def _register_request(
         self, address: Tuple[str, int], request: Request, callback_dump: Optional[str]
@@ -317,6 +314,7 @@ class Server:
                 callback=callback_type,
                 callback_dump=callback_dump,
                 payload=self._payload_text(message),
+                payload_full=self._payload_text(message, limit=None),
             )
 
             response_bytes = pickle.dumps((Response(request.tag, message), status))

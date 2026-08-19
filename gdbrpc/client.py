@@ -22,25 +22,26 @@
 
 import json
 import logging
-import os
 import queue
 import socket
 import sys
 import threading
 import time
-from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
 import cloudpickle as pickle
 from gdbrpc.utils import (
     FRAME_HEADER_SIZE,
+    HUMAN_ONLY_FIELDS,
     EventType,
     PacketStatus,
     PostRequest,
     Request,
     Response,
     format_endpoint,
+    format_human_event,
     make_session_uuid,
+    setup_file_logging,
     socket_recv,
     socket_send,
     truncate_text,
@@ -55,6 +56,7 @@ class Client:
         log_level: int = logging.INFO,
         log_path: Optional[str] = None,
         timeout: float = 300,
+        human_log_path: Optional[str] = None,
     ):
         self._host = host
         self._port = port
@@ -69,19 +71,16 @@ class Client:
         self._pending_callbacks: Dict[int, PostRequest] = {}
         self._request_lock = threading.Lock()
 
-        self._logger = logging.getLogger(__name__)
-        if not self._logger.hasHandlers():
-            self._logger.setLevel(log_level)
+        self._logger, self._human_logger = setup_file_logging(
+            __name__, "gdbrpc_client", log_level, log_path, human_log_path
+        )
 
-            if log_path is None:
-                timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-                pid = os.getpid()
-                log_path = f"gdbrpc_client-{timestamp}-pid{pid}.log"
-
-            handler = logging.FileHandler(log_path)
-            formatter = logging.Formatter("%(asctime)s gdbrpc_client: %(message)s")
-            handler.setFormatter(formatter)
-            self._logger.addHandler(handler)
+    def _log_human_event(
+        self, event: EventType, request: Optional[Request] = None, **fields
+    ) -> None:
+        message = format_human_event("client", event, request, **fields)
+        if message is not None:
+            self._human_logger.info(message)
 
     def _log_event(
         self, event: EventType, request: Optional[Request] = None, **fields
@@ -92,15 +91,15 @@ class Client:
             parts.append(f"req={request.req_seq or 'unknown'}")
         parts.append(f"event={event.value}")
         for key, value in fields.items():
-            if value is None:
+            if value is None or key in HUMAN_ONLY_FIELDS:
                 continue
             parts.append(f"{key}={value}")
         self._logger.info(" ".join(parts))
+        self._log_human_event(event, request, **fields)
 
-    def _payload_text(self, payload: Any) -> str:
-        if isinstance(payload, str):
-            return json.dumps(truncate_text(payload))
-        return json.dumps(truncate_text(str(payload)))
+    def _payload_text(self, payload: Any, limit: Optional[int] = 256) -> str:
+        text = payload if isinstance(payload, str) else str(payload)
+        return json.dumps(truncate_text(text, limit))
 
     def _counts(self) -> Tuple[int, int]:
         with self._request_lock:
@@ -124,7 +123,7 @@ class Client:
 
             return True
         except Exception as e:
-            logging.error(f"Failed to connect {self._host}:{self._port}: {e}")
+            self._logger.error(f"Failed to connect {self._host}:{self._port}: {e}")
             return False
 
     def _listen_responses(self, socket: socket.socket):
@@ -162,6 +161,7 @@ class Client:
                         stage="error",
                         status="python_version_mismatch",
                         payload=self._payload_text(response.payload),
+                        payload_full=self._payload_text(response.payload, limit=None),
                     )
                     continue
 
@@ -178,6 +178,9 @@ class Client:
                             callback=f"{callback.__class__.__name__}",
                             callback_dump=callback.callback_dump(),
                             payload=self._payload_text(response.payload),
+                            payload_full=self._payload_text(
+                                response.payload, limit=None
+                            ),
                         )
                     except Exception as e:
                         self._log_event(
@@ -202,6 +205,7 @@ class Client:
                         stage="result" if status == PacketStatus.NO_CALLBACK else "ack",
                         status="ok",
                         payload=self._payload_text(response.payload),
+                        payload_full=self._payload_text(response.payload, limit=None),
                     )
                     with self._request_lock:
                         # Only pop for a true final result. A NO_CALLBACK reply

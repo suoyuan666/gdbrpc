@@ -21,6 +21,8 @@
 ############################################################################
 
 import json
+import logging
+import os
 import queue
 import socket
 import struct
@@ -28,6 +30,7 @@ import subprocess
 import threading
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum, IntEnum
 from typing import Any, Optional, Tuple
 
@@ -77,10 +80,95 @@ def format_endpoint(endpoint: Optional[Tuple[str, int]]) -> str:
     return f"{host}:{port}"
 
 
-def truncate_text(text: str, limit: int = 256) -> str:
-    if len(text) <= limit:
+def truncate_text(text: str, limit: Optional[int] = 256) -> str:
+    if limit is None or len(text) <= limit:
         return text
     return f"{text[:limit]}...[truncated,total={len(text)}]"
+
+
+def setup_file_logging(
+    name: str,
+    prefix: str,
+    log_level: int,
+    log_path: Optional[str] = None,
+    human_log_path: Optional[str] = None,
+) -> Tuple[logging.Logger, logging.Logger]:
+    """Configure structured and human-readable file loggers for one role.
+
+    The default file names embed a timestamp and pid that are computed once
+    and shared by both loggers. Returns (logger, human_logger).
+    """
+    formatter = logging.Formatter(f"%(asctime)s {prefix}: %(message)s")
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    pid = os.getpid()
+
+    logger = logging.getLogger(name)
+    logger.setLevel(log_level)
+    if not logger.handlers:
+        logger.propagate = False
+        if log_path is None:
+            log_path = f"{prefix}-{timestamp}-pid{pid}.log"
+        handler = logging.FileHandler(log_path)
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+    human_logger = logging.getLogger(f"{name}.human")
+    human_logger.setLevel(log_level)
+    if not human_logger.handlers:
+        human_logger.propagate = False
+        if human_log_path is None:
+            human_log_path = f"{prefix}-human-{timestamp}-pid{pid}.log"
+        human_handler = logging.FileHandler(human_log_path)
+        human_handler.setFormatter(formatter)
+        human_logger.addHandler(human_handler)
+
+    return logger, human_logger
+
+
+def format_human_event(
+    role: str,
+    event: "EventType",
+    request: Optional["Request"] = None,
+    **fields: Any,
+) -> Optional[str]:
+    """Format important RPC lifecycle events for a human reader."""
+    title = HUMAN_EVENT_NAMES.get((role, event))
+    if title is None:
+        return None
+
+    details = []
+    if request is not None:
+        details.append(f"request={request.req_seq or 'unknown'}")
+        details.append(f"type={request.__class__.__name__}")
+    for key in ("status", "target", "source", "callback", "error", "note"):
+        value = fields.get(key)
+        if value is not None:
+            details.append(f"{key}={value}")
+
+    lines = [title + (f" ({', '.join(details)})" if details else "")]
+    for key, label in (
+        ("dump", "request"),
+        ("callback_dump", "callback"),
+        ("payload_full", "response"),
+        ("payload", "payload"),
+    ):
+        value = fields.get(key)
+        if value is None:
+            continue
+        try:
+            parsed = json.loads(value) if isinstance(value, str) else value
+            text = json.dumps(parsed, indent=2, ensure_ascii=False)
+        except (TypeError, ValueError):
+            text = str(value)
+        lines.append(f"  {label}:")
+        lines.extend(f"    {line}" for line in text.splitlines() or [""])
+
+    return "\n".join(lines) + "\n"
+
+
+# Keys carried only for the human-readable log; skipped by the structured
+# one-line log to keep it compact (e.g. full untruncated payloads).
+HUMAN_ONLY_FIELDS = frozenset({"payload_full"})
 
 
 class EventType(str, Enum):
@@ -98,6 +186,25 @@ class EventType(str, Enum):
     TRANSPORT_SEND_BODY = "transport_send_body"
     TRANSPORT_RECV_LEN = "transport_recv_len"
     TRANSPORT_RECV_BODY = "transport_recv_body"
+
+
+HUMAN_EVENT_NAMES = {
+    ("client", EventType.SEND): "SEND REQUEST",
+    ("server", EventType.RECV): "RECEIVE REQUEST",
+    ("server", EventType.DISPATCH): "DISPATCH GDB COMMAND",
+    ("server", EventType.REPLY): "SEND ACK",
+    ("server", EventType.DONE): "RECEIVE GDB RESPONSE",
+    ("client", EventType.RECV): "RECEIVE RESPONSE",
+    ("client", EventType.CALLBACK): "CALLBACK RESULT",
+    ("client", EventType.CONNECT): "CONNECT",
+    ("client", EventType.DISCONNECT): "DISCONNECT",
+    ("server", EventType.CONNECT): "CONNECT",
+    ("server", EventType.DISCONNECT): "DISCONNECT",
+    ("client", EventType.ERROR): "ERROR",
+    ("server", EventType.ERROR): "ERROR",
+    ("client", EventType.TIMEOUT): "TIMEOUT",
+    ("server", EventType.TIMEOUT): "TIMEOUT",
+}
 
 
 @dataclass
