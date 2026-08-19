@@ -228,6 +228,9 @@ class Response:
 
 
 class Request:
+    # Internal bookkeeping fields that dump() must never include.
+    _DUMP_EXCLUDE = frozenset({"tag", "req_seq", "session_uuid", "peer"})
+
     def __init__(self):
         self.tag = id(self)
         self.req_seq: Optional[str] = None
@@ -240,14 +243,26 @@ class Request:
     def dump(self) -> str:
         """Return a JSON string representation of this request.
 
-        Subclasses MUST override this method to provide a pure function
-        that returns a deterministic JSON string. The output should:
-        - Be deterministic (same input -> same output)
-        - Not include internal fields (tag, req_seq, session_uuid, peer)
-        - Include all relevant business fields
+        By default this dumps every instance attribute as a field, producing
+        a deterministic JSON string. Internal bookkeeping fields (tag,
+        req_seq, session_uuid, peer) and any value that cannot be serialized
+        to JSON (e.g. threading.Event) are skipped. Subclasses may override
+        this method to customize the output, or extend _DUMP_EXCLUDE to hide
+        additional internal fields.
         """
-        raise NotImplementedError(
-            f"{self.__class__.__name__}.dump() must be implemented by subclass"
+        fields = {}
+        for name, value in self.__dict__.items():
+            if name in self._DUMP_EXCLUDE:
+                continue
+            try:
+                json.dumps(value)
+            except (TypeError, ValueError):
+                continue
+            fields[name] = value
+        return json.dumps(
+            {"type": self.__class__.__name__, "fields": fields},
+            sort_keys=True,
+            separators=(",", ":"),
         )
 
 
@@ -285,19 +300,6 @@ class ShellExec(Request):
             self.is_gdb_command = False
 
         self.command = command
-
-    def dump(self) -> str:
-        return json.dumps(
-            {
-                "type": self.__class__.__name__,
-                "fields": {
-                    "command": self.command,
-                    "is_gdb_command": self.is_gdb_command,
-                },
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
 
     def _run_shell_command(self, command) -> str:
         try:
