@@ -276,12 +276,9 @@ class PostRequest(Request):
     def callback_dump(self) -> str:
         """Return a JSON string representation of this callback.
 
-        Subclasses MUST override this method if they have additional fields
-        to dump beyond what dump() provides.
+        By default this reuses dump().
         """
-        raise NotImplementedError(
-            f"{self.__class__.__name__}.callback_dump() must be implemented by subclass"
-        )
+        return self.dump()
 
 
 class ShellExec(Request):
