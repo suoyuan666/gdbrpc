@@ -150,7 +150,6 @@ def format_human_event(
         ("dump", "request"),
         ("callback_dump", "callback"),
         ("payload_full", "response"),
-        ("payload", "payload"),
     ):
         value = fields.get(key)
         if value is None:
