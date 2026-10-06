@@ -112,54 +112,66 @@ print(output)
 client.disconnect()
 ```
 
-### Using the Interactive CLI
+### Using the CLI
 
-The easiest way to interact with a GDB server is using the built-in CLI:
+Load the current source checkout in GDB with the repository initializer:
+
+```gdb
+source /path/to/gdbrpc/gdbinit.py
+gdbrpc start --host 127.0.0.1 --port 20819
+```
+
+Run the module or installed `gdbrpc` command without an action to open the
+interactive client:
 
 ```bash
-# Connect to default server (localhost:20819)
-python3 -m gdbrpc
-
-# Connect to custom host and port
-python3 -m gdbrpc --host 192.168.1.100 --port 20820
-
-# Show help
-python3 -m gdbrpc --help
+python3 -m gdbrpc --host localhost --port 20819
+gdbrpc --host localhost --port 20819
 ```
 
-Once connected, you can type GDB commands directly:
+For automation, repeat `-c` to send complete GDB command units in one RPC.
+Each unit may itself contain native multiline GDB syntax. A failed unit is
+reported, and the remaining units still run:
 
-```
-Welcome to the GDB Remote Protocol Client
-Type `exit` or `quit` to disconnect.
-Type `help` to show this help message.
-If you need `interrupt` command to stop the target, use Ctrl+C.
-gdb> info threads
-  Id   Target Id                                Frame
-* 1    process 1234 "myprogram"                 main () at main.c:42
-gdb> backtrace
-#0  main () at main.c:42
-#1  0x00007ffff7a05b97 in __libc_start_main ()
-gdb> print my_variable
-$1 = 123
-gdb> !ls
-file1.txt  file2.txt  myprogram
-gdb> exit
+```bash
+gdbrpc --port 20819 -c 'help' -c 'bt' -c 'info registers'
+gdbrpc --port 20819 \
+  -c $'define dump_state\n  bt\n  info registers\nend' \
+  -c 'dump_state'
 ```
 
-Or use the CLI programmatically from Python:
+`-f` accepts either a local Python file or inline Python source. An existing
+file is read locally; otherwise the argument is compiled as source in GDB:
+
+```bash
+gdbrpc --port 20819 -f inspect.py
+gdbrpc --port 20819 -f 'import gdb; print(gdb.newest_frame().name())'
+gdbrpc --port 20819 -f $'import gdb\nprint(gdb.selected_thread())'
+```
+
+Add `--wait` when the script registers a GDB callback. The CLI remains
+connected until the script calls the injected `emit(value)` function once:
 
 ```python
-from gdbrpc import ClientCLI
+# wait_stop.py
+import gdb
 
-cli = ClientCLI(host="localhost", port=20819)
-cli.start()
+
+def on_stop(event):
+    gdb.events.stop.disconnect(on_stop)
+    emit(str(event))
+
+
+gdb.events.stop.connect(on_stop)
 ```
 
-**CLI Features:**
-- Execute any GDB command interactively
-- Run shell commands with `!` prefix (e.g., `!ls`, `!pwd`)
-- Use Ctrl+C to send interrupt signal to target
+```bash
+gdbrpc --port 20819 -f wait_stop.py --wait
+```
+
+A waiting script must unregister its GDB callback before calling `emit`.
+One CLI invocation receives one emitted value; continuous event streaming is
+not supported.
 
 ## TODO
 

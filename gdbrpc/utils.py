@@ -20,6 +20,8 @@
 #
 ############################################################################
 
+import contextlib
+import io
 import json
 import logging
 import os
@@ -42,7 +44,7 @@ def recv_all(connection: socket.socket, length: int) -> bytes:
     while len(data) < length:
         chunk = connection.recv(length - len(data))
         if not chunk:
-            raise ConnectionError("Socket connection broken during receive")
+            raise ConnectionError("Socket connection closed during receive")
         data += chunk
     return data
 
@@ -54,19 +56,9 @@ def socket_recv(connection: socket.socket) -> bytes:
     return recv_all(connection, data_length)
 
 
-def send_all(connection: socket.socket, data: bytes) -> None:
-    total_sent = 0
-    while total_sent < len(data):
-        sent = connection.send(data[total_sent:])
-        if sent == 0:
-            raise RuntimeError("Socket connection broken")
-        total_sent += sent
-
-
 def socket_send(connection: socket.socket, data: bytes) -> None:
-    length_prefix = struct.pack("!I", len(data))
-    send_all(connection, length_prefix)
-    send_all(connection, data)
+    frame = struct.pack("!I", len(data)) + data
+    connection.sendall(frame)
 
 
 def make_session_uuid() -> str:
@@ -226,6 +218,19 @@ class Response:
         self.payload = payload
 
 
+class RemoteError(Exception):
+    def __init__(self, error_type: str, message: str | None = None):
+        if message is None:
+            message = error_type
+            error_type = "RemoteError"
+        super().__init__(error_type, message)
+        self.error_type = error_type
+        self.message = message
+
+    def __str__(self):
+        return f"{self.error_type}: {self.message}"
+
+
 class Request:
     # Internal bookkeeping fields that dump() must never include.
     _DUMP_EXCLUDE = frozenset({"tag", "req_seq", "session_uuid", "peer"})
@@ -269,6 +274,7 @@ class PostRequest(Request):
     def __init__(self):
         super().__init__()
         self.finish = threading.Event()
+        self.error: Exception | None = None
 
     def __call__(self, argument: Any):
         raise NotImplementedError("Subclasses must implement this method")
@@ -279,6 +285,77 @@ class PostRequest(Request):
         By default this reuses dump().
         """
         return self.dump()
+
+
+class GdbCommand(Request):
+    def __init__(self, command: str):
+        super().__init__()
+        self.command = command
+
+    def __call__(self, result: queue.Queue):
+        import gdb
+
+        try:
+            result.put(gdb.execute(self.command, to_string=True))
+        except Exception as error:
+            result.put(RemoteError(type(error).__name__, str(error)))
+
+
+class GdbCommandBatch(Request):
+    def __init__(self, commands: list[str]):
+        super().__init__()
+        self.commands = commands
+
+    def __call__(self, result: queue.Queue):
+        import gdb
+
+        results = []
+        for index, command in enumerate(self.commands, 1):
+            try:
+                results.append(
+                    {
+                        "index": index,
+                        "command": command,
+                        "output": gdb.execute(command, to_string=True),
+                        "error": None,
+                    }
+                )
+            except Exception as error:
+                results.append(
+                    {
+                        "index": index,
+                        "command": command,
+                        "output": "",
+                        "error": f"{type(error).__name__}: {error}",
+                    }
+                )
+        result.put(results)
+
+
+class PythonExec(Request):
+    def __init__(self, source: str, filename: str, wait: bool = False):
+        super().__init__()
+        self.source = source
+        self.filename = filename
+        self.wait = wait
+
+    def __call__(self, result: queue.Queue):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        namespace: dict[str, Any] = {
+            "__name__": "__main__",
+            "__file__": self.filename,
+        }
+        if self.wait:
+            namespace["emit"] = result.put
+
+        try:
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                exec(compile(self.source, self.filename, "exec"), namespace, namespace)
+            if not self.wait:
+                result.put(stdout.getvalue() + stderr.getvalue())
+        except Exception as error:
+            result.put(RemoteError(type(error).__name__, str(error)))
 
 
 class ShellExec(Request):

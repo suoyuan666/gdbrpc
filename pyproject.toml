@@ -21,6 +21,9 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
 ]
 
+[project.scripts]
+gdbrpc = "gdbrpc.__main__:main"
+
 [tool.setuptools]
 package-dir = { "gdbrpc" = "gdbrpc" }
 

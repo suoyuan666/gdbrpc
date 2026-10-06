@@ -114,54 +114,63 @@ print(output)
 client.disconnect()
 ```
 
-### Using the Interactive CLI
+### 使用 CLI
 
-gdbrpc 作为模块直接运行就是在启动 CLI 界面
+可用仓库根目录的初始化脚本在 GDB 中加载当前源码：
+
+```gdb
+source /path/to/gdbrpc/gdbinit.py
+gdbrpc start --host 127.0.0.1 --port 20819
+```
+
+不指定操作时，模块或安装后的 `gdbrpc` 命令会进入交互模式：
 
 ```bash
-# Connect to default server (localhost:20819)
-python3 -m gdbrpc
-
-# Connect to custom host and port
-python3 -m gdbrpc --host 192.168.1.100 --port 20820
-
-# Show help
-python3 -m gdbrpc --help
+python3 -m gdbrpc --host localhost --port 20819
+gdbrpc --host localhost --port 20819
 ```
 
-连接后，你可以像操作 GDB CLI 一样操作它。当然这是 Python 简单模拟的 CLI 界面，所以不能和真正的 GDB CLI 相比
+自动化场景可重复使用 `-c`，在一次 RPC 中发送多个完整 GDB 命令单元。每个单元
+本身仍可包含 GDB 原生多行语法；某个单元失败时会报告错误并继续执行后续单元：
 
-```
-Welcome to the GDB Remote Protocol Client
-Type `exit` or `quit` to disconnect.
-Type `help` to show this help message.
-If you need `interrupt` command to stop the target, use Ctrl+C.
-gdb> info threads
-  Id   Target Id                                Frame
-* 1    process 1234 "myprogram"                 main () at main.c:42
-gdb> backtrace
-#0  main () at main.c:42
-#1  0x00007ffff7a05b97 in __libc_start_main ()
-gdb> print my_variable
-$1 = 123
-gdb> !ls
-file1.txt  file2.txt  myprogram
-gdb> exit
+```bash
+gdbrpc --port 20819 -c 'help' -c 'bt' -c 'info registers'
+gdbrpc --port 20819 \
+  -c $'define dump_state\n  bt\n  info registers\nend' \
+  -c 'dump_state'
 ```
 
-同样的，CLI 也提供了一些 API
+`-f` 既可接收客户端本地 Python 文件，也可直接接收 Python 源码。参数对应现有普通
+文件时读取文件内容，否则将参数作为源码在 GDB 主线程执行：
+
+```bash
+gdbrpc --port 20819 -f inspect.py
+gdbrpc --port 20819 -f 'import gdb; print(gdb.newest_frame().name())'
+gdbrpc --port 20819 -f $'import gdb\nprint(gdb.selected_thread())'
+```
+
+脚本注册 GDB callback 时增加 `--wait`。CLI 会保持连接，直到脚本调用一次注入的
+`emit(value)`：
 
 ```python
-from gdbrpc import ClientCLI
+# wait_stop.py
+import gdb
 
-cli = ClientCLI(host="localhost", port=20819)
-cli.start()
+
+def on_stop(event):
+    gdb.events.stop.disconnect(on_stop)
+    emit(str(event))
+
+
+gdb.events.stop.connect(on_stop)
 ```
 
-**CLI Features:**
-- 执行 GDB 命令
-- 执行 shell，这里和 GDB 的还是一样的语法，即使用 `!` 或 `shell` 标明这个命令是一个 shell
-- 使用 Ctrl+C 停止当前程序的运行
+```bash
+gdbrpc --port 20819 -f wait_stop.py --wait
+```
+
+等待脚本必须在调用 `emit` 前注销 GDB callback。一次 CLI 调用只接收一个值，首版
+不支持连续事件流。
 
 ## TODO
 

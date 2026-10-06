@@ -23,10 +23,14 @@
 __all__ = [
     "Client",
     "ClientCLI",
+    "GdbCommand",
+    "GdbCommandBatch",
     "PostRequest",
     "Request",
+    "RemoteError",
     "Response",
     "PacketStatus",
+    "PythonExec",
     "Server",
     "ShellExec",
 ]
@@ -35,15 +39,25 @@ from .cli import ClientCLI
 
 # Client must be imported first because ClientCLI depends on it
 from .client import Client
-from .utils import PacketStatus, PostRequest, Request, Response, ShellExec
+from .utils import (
+    GdbCommand,
+    GdbCommandBatch,
+    PacketStatus,
+    PostRequest,
+    PythonExec,
+    RemoteError,
+    Request,
+    Response,
+    ShellExec,
+)
 
 # Register GDB commands if running inside GDB
 try:
     from gdb import COMMAND_USER, Command
 
-    from .commands import (  # noqa: F401
+    from .commands import StartSocketClient  # noqa: F401
+    from .commands import (
         SocketServerStatus,
-        StartSocketClient,
         StartSocketServer,
         StopSocketServer,
     )
@@ -65,6 +79,7 @@ except ImportError:
 
 try:
     from ._version import version
+
     __version__ = version
 except ImportError:
     __version__ = "0.0.0.dev0"

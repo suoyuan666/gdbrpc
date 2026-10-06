@@ -36,6 +36,7 @@ from gdbrpc.utils import (
     EventType,
     PacketStatus,
     PostRequest,
+    RemoteError,
     Request,
     Response,
     format_endpoint,
@@ -67,6 +68,7 @@ class Client:
         self._local_peer: Optional[str] = None
         self._next_req_seq = 0
         self._response = queue.Queue()
+        self._response_waiters = 0
         self._pending_requests: Dict[int, Request] = {}
         self._pending_callbacks: Dict[int, PostRequest] = {}
         self._request_lock = threading.Lock()
@@ -108,6 +110,7 @@ class Client:
     def connect(self):
         try:
             self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self._socket.connect((self._host, self._port))
             self._connected = True
             self._session_uuid = make_session_uuid()
@@ -154,7 +157,7 @@ class Client:
 
                 if status == PacketStatus.PYTHON_VERSION_MISMATCH:
                     response.payload += f"\nclient python version: {sys.version}"
-                    self._response.put(response.payload)
+                    self._response.put(response)
                     self._log_event(
                         EventType.RECV,
                         request,
@@ -169,7 +172,10 @@ class Client:
                     assert isinstance(callback, PostRequest)
 
                     try:
-                        callback(response.payload)
+                        if isinstance(response.payload, RemoteError):
+                            callback.error = response.payload
+                        else:
+                            callback(response.payload)
                         self._log_event(
                             EventType.CALLBACK,
                             request,
@@ -183,6 +189,7 @@ class Client:
                             ),
                         )
                     except Exception as e:
+                        callback.error = e
                         self._log_event(
                             EventType.ERROR,
                             request,
@@ -216,20 +223,41 @@ class Client:
         except ConnectionError:
             self._logger.info("Connection closed by server")
             self.disconnect()
+        except OSError as e:
+            if self._connected:
+                self._logger.error(f"Error receiving data: {e}")
+            else:
+                self._logger.debug(f"Socket closed during client shutdown: {e}")
+            self.disconnect()
         except Exception as e:
             self._logger.error(f"Error receiving data: {e}")
             self.disconnect()
 
     def disconnect(self):
+        was_connected = self._connected
         self._connected = False
         self._log_event(
             EventType.DISCONNECT, target=format_endpoint((self._host, self._port))
         )
-        if self._socket:
+        if hasattr(self, "_socket"):
             try:
                 self._socket.close()
             except Exception as e:
                 self._logger.error(f"Error closing socket: {e}")
+        if was_connected:
+            message = "Connection closed before request completed"
+            error = ConnectionError(message)
+            with self._request_lock:
+                for _ in range(self._response_waiters):
+                    self._response.put(
+                        Response(0, RemoteError("ConnectionError", message))
+                    )
+                callbacks = list(self._pending_callbacks.values())
+                self._pending_callbacks.clear()
+                self._pending_requests.clear()
+            for callback in callbacks:
+                callback.error = error
+                callback.finish.set()
 
     def no_pending_requests(self) -> bool:
         return len(self._pending_requests) == 0 and len(self._pending_callbacks) == 0
@@ -310,6 +338,8 @@ class Client:
         started_at = time.monotonic()
         actual_timeout = self._timeout if timeout is None else timeout
 
+        with self._request_lock:
+            self._response_waiters += 1
         try:
             rs = self._response.get(timeout=actual_timeout)
         except queue.Empty:
@@ -340,5 +370,10 @@ class Client:
                 note="Client did not receive response within timeout",
             )
             raise TimeoutError("Request timed out")
+        finally:
+            with self._request_lock:
+                self._response_waiters -= 1
 
+        if isinstance(rs.payload, RemoteError):
+            raise rs.payload
         return rs.payload
